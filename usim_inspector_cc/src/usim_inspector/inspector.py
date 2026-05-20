@@ -241,10 +241,12 @@ class Inspector:
         inf_note = f", 추정 {len(inferred)}개" if inferred else ""
         result.log(f"  📷 {img.name}: ICCID {len(confirmed)}개 확인{inf_note}, "
                    f"위반 {len(violations)}건")
+        for ic in confirmed:
+            result.log(f"    ✅ 확인: {ic}")
         for ic, serial in inferred:
             result.log(
-                f"    ⚠️ 추정 ICCID: {ic}  (시리얼 '{serial}' OCR 인식 — "
-                f"이미지 직접 확인 권고)", "WARN"
+                f"    ⚠️ 추정: {ic}  (시리얼 '{serial}' — 이미지 직접 확인 권고)",
+                "WARN"
             )
 
     def _inspect_video_file(self, vid: Path, lo: int, hi: int,

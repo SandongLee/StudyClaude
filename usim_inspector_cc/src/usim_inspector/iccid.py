@@ -72,8 +72,38 @@ class IccidParser:
         )
 
     def extract_all(self, text: str) -> List[str]:
-        """텍스트에서 완전히 인식된 ICCID 목록 반환."""
-        return [m.upper() for m in self.regex.findall(text)]
+        """텍스트에서 완전히 인식된 ICCID 목록 반환.
+
+        OCR 오인식 대응:
+        - hex 문자 사이 공백 제거 (4자리 그룹 표기 대응)
+        - prefix 첫 자리 3/B → 8 보정 (lookbehind 없이, 앞 문자 무관하게 보정)
+        """
+        found: set = set()
+        norm = re.sub(r'(?<=[0-9A-Fa-f])\s+(?=[0-9A-Fa-f])', '', text)
+
+        for variant in {text, norm}:
+            # 정상 매칭
+            found.update(m.upper() for m in self.regex.findall(variant))
+
+            # fuzzy 보정: prefix 첫 자리 3/B → 8 (앞 문자 무관하게 적용)
+            if self.prefix and self.prefix[0] == '8':
+                digits_after = self.length - len(self.prefix) - 1
+                fuzzy = re.compile(
+                    rf'[38B]{re.escape(self.prefix[1:])}'
+                    rf'[0-9]{{{digits_after}}}[A-Fa-f0-9]',
+                    re.IGNORECASE
+                )
+                for m in fuzzy.findall(variant):
+                    corrected = (self.prefix[0] + m[1:]).upper()
+                    if self.regex.fullmatch(corrected):
+                        found.add(corrected)
+
+        return list(found)
+
+    def _ocr_variants(self, text: str) -> List[str]:
+        """공백 제거 변형 텍스트 목록 (infer_from_partial에서 사용)."""
+        norm = re.sub(r'(?<=[0-9A-Fa-f])\s+(?=[0-9A-Fa-f])', '', text)
+        return list({text, norm})
 
     def infer_from_partial(
         self, text: str, op_model: str,
@@ -98,27 +128,48 @@ class IccidParser:
         ser_start = self.ser_slice.start  # 0-based (예: 11)
 
         # missing: OCR이 잘라낸 앞부분 자릿수 (1 ~ 시리얼 시작 전까지)
-        for missing in range(1, min(ser_start, len(op_model)) + 1):
-            head = op_model[:missing]
-            tail_len = self.length - missing
+        # _ocr_variants로 공백 보정 변형도 함께 탐색
+        for variant in self._ocr_variants(text):
+            for missing in range(1, min(ser_start, len(op_model))):
+                head = op_model[:missing]
+                tail_len = self.length - missing
 
-            tail_pat = re.compile(
-                rf'(?<![0-9A-Fa-f])[0-9]{{{tail_len - 1}}}[A-Fa-f0-9]'
-                rf'(?![0-9A-Fa-f])',
-                re.IGNORECASE
-            )
-            for m in tail_pat.finditer(text):
-                candidate = (head + m.group()).upper()
-                if len(candidate) != self.length:
-                    continue
-                if not self.regex.fullmatch(candidate):
-                    continue
-                if candidate in already:
-                    continue
-                # tail 내에서 시리얼 위치 추출
-                serial_read = m.group()[ser_start - missing:
-                                        self.ser_slice.stop - missing]
-                results.append((candidate, serial_read))
-                already.add(candidate)
+                # Pass 1: 경계 기반 탐색 (tail이 독립적으로 존재하는 경우)
+                tail_pat = re.compile(
+                    rf'(?<![0-9A-Fa-f])[0-9]{{{tail_len - 1}}}[A-Fa-f0-9]'
+                    rf'(?![0-9A-Fa-f])',
+                    re.IGNORECASE
+                )
+                for m in tail_pat.finditer(variant):
+                    candidate = (head + m.group()).upper()
+                    if len(candidate) != self.length:
+                        continue
+                    if not self.regex.fullmatch(candidate):
+                        continue
+                    if candidate in already:
+                        continue
+                    serial_read = m.group()[ser_start - missing:
+                                            self.ser_slice.stop - missing]
+                    results.append((candidate, serial_read))
+                    already.add(candidate)
+
+                # Pass 2: 겹침 탐색 (tail이 더 긴 hex 문자열 안에 묻혀 있는 경우)
+                overlap_pat = re.compile(
+                    rf'(?=([0-9]{{{tail_len - 1}}}[A-Fa-f0-9]))',
+                    re.IGNORECASE
+                )
+                for m in overlap_pat.finditer(variant):
+                    tail = m.group(1)
+                    candidate = (head + tail).upper()
+                    if len(candidate) != self.length:
+                        continue
+                    if not self.regex.fullmatch(candidate):
+                        continue
+                    if candidate in already:
+                        continue
+                    serial_read = tail[ser_start - missing:
+                                       self.ser_slice.stop - missing]
+                    results.append((candidate, serial_read))
+                    already.add(candidate)
 
         return results
