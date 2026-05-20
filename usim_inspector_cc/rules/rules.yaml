@@ -1,0 +1,109 @@
+# =====================================================
+# USIM 카드 품질검수 규칙 설정 파일
+# =====================================================
+# 검수 방법이 변경되면 이 파일만 수정하세요.
+# 코드를 건드릴 필요가 없습니다.
+# 수정 후 저장하고 검수 프로그램을 다시 실행하세요.
+# =====================================================
+
+# [1] log 폴더 식별 키워드 (대소문자 무관, 부분 일치)
+# 폴더명에 이 단어가 포함되어 있으면 log 폴더로 인식합니다.
+log_folder_keywords:
+  - log
+  - 로그
+
+# [2] 체크파일 식별 키워드 (대소문자 무관, 부분 일치)
+# log 폴더 내의 텍스트 파일 중 이 단어가 포함된 파일을 체크파일로 인식
+check_file_keywords:
+  - check
+  - 체크
+  - 검사
+  # - 条码扫描   # 중국어 "바코드 스캔"도 추가 가능
+  # - 扫描
+
+# [3] ICCID 형식 정의
+iccid:
+  prefix: "898205"           # ICCID 시작 문자열 (사업자 prefix)
+  total_length: 20           # ICCID 전체 자릿수
+  
+  # ICCID 필드 분해 규칙 (1부터 시작하는 위치, 끝 포함)
+  fields:
+    operator:                # 사업자 코드
+      start: 1
+      end: 6
+    model:                   # 모델 코드
+      start: 7
+      end: 11
+    serial:                  # 시리얼 번호
+      start: 12
+      end: 18
+    # 19~20: 체크자리(사용 안 함)
+
+# [4] 체크파일 데이터 형식
+check_file_format:
+  encoding: "utf-8"          # 또는 cp949, euc-kr 등
+  delimiter: "whitespace"    # 공백 구분자
+  
+  # 첫 행에 포함되는 필드 순서 (선택적 필드는 optional: true)
+  expected_fields:
+    - name: ICCID
+      optional: false
+    - name: CPLC
+      optional: true         # CPLC는 없을 수도 있음
+    - name: 날짜
+      optional: false
+    - name: 시간
+      optional: false
+
+# [5] 검수 규칙 (각 규칙은 활성/비활성 가능)
+validations:
+  
+  # 사업자/모델 일관성: 모든 행의 사업자와 모델이 동일해야 함
+  consistency_check:
+    enabled: true
+    check_fields:
+      - operator
+      - model
+    on_violation: "report_and_continue"   # 또는 "stop"
+  
+  # 시리얼 범위: 모든 행의 시리얼이 [시작, 마지막] 사이에 있어야 함
+  serial_range_check:
+    enabled: true
+    on_violation: "report_and_continue"
+  
+  # 미디어 파일(이미지/동영상) 검토: ICCID가 시리얼 범위 내에 있어야 함
+  media_iccid_check:
+    enabled: true
+    # 검토할 파일 확장자
+    image_extensions:
+      - .jpg
+      - .jpeg
+      - .png
+      - .bmp
+    video_extensions:
+      - .mp4
+      - .avi
+      - .mov
+      - .mkv
+    # 동영상에서 프레임을 추출할 간격 (초당 N장)
+    # 높을수록 인식률 향상, 처리 시간 증가. 권장: 3~10
+    video_fps_sample: 5
+    # 동영상 1개당 최대 처리 프레임 수 (0=무제한)
+    # 긴 동영상에서 무한 대기 방지. 120장 = 5fps 기준 약 24초 분량
+    video_max_frames: 120
+
+# [6] 보고서 출력 설정
+report:
+  format: xlsx               # xlsx, html, csv
+  include_screenshots: true  # 박스 라벨 등 캡처 첨부
+  filename_template: "검수보고서_{batch}_{date}.xlsx"
+  
+# [7] 운영자/모델 코드 매핑 (선택사항)
+# 사업자/모델 코드를 사람이 읽을 수 있는 이름으로 표시
+known_operators:
+  "898205": "SK텔링크 (프리텔레콤)"
+  # "898206": "다른 사업자 예시"
+
+known_models:
+  "22046": "MFCTN2-C04 / TRIPLE USIM"
+  # "22047": "다른 모델 예시"

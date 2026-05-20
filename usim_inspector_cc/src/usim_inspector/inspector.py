@@ -152,7 +152,8 @@ class Inspector:
 
         img_exts = {e.lower() for e in cfg.get('image_extensions', [])}
         vid_exts = {e.lower() for e in cfg.get('video_extensions', [])}
-        fps = cfg.get('video_fps_sample', 2)
+        fps = cfg.get('video_fps_sample', 5)
+        max_frames = cfg.get('video_max_frames', 120)
 
         try:
             lo = int(result.first_serial)
@@ -169,7 +170,7 @@ class Inspector:
             if ext in img_exts:
                 self._inspect_image_file(f, lo, hi, result)
             elif ext in vid_exts:
-                self._inspect_video_file(f, lo, hi, fps, result)
+                self._inspect_video_file(f, lo, hi, fps, max_frames, result)
 
     def _classify_iccids(self, iccids: list, lo: int, hi: int) -> list:
         """ICCID 리스트 중 범위 위반인 것만 반환."""
@@ -250,20 +251,32 @@ class Inspector:
             )
 
     def _inspect_video_file(self, vid: Path, lo: int, hi: int,
-                            fps: float, result: CheckResult) -> None:
+                            fps: float, max_frames: int,
+                            result: CheckResult) -> None:
         if not tools().ffmpeg:
             result.log(f"  🎬 {vid.name}: ffmpeg 없음 → 동영상 스킵", "WARN")
             return
 
-        frames = extract_video_frames(vid, fps)
+        frames = extract_video_frames(vid, fps, max_frames)
+        if not frames:
+            result.log(f"  🎬 {vid.name}: 프레임 추출 실패", "WARN")
+            return
+
+        result.log(f"  🎬 {vid.name}: {len(frames)}개 프레임 분석 중 "
+                   f"(fps={fps}, 최대{max_frames}장)...")
         confirmed_all: set = set()
         inferred_all: list = []
+        tmp_dir = frames[0].parent
 
-        for frame in frames:
-            text = ocr_image(str(frame))
+        for i, frame in enumerate(frames, 1):
+            text = ocr_image(str(frame), is_video_frame=True)
             frame_confirmed = list(set(self.iccid_parser.extract_all(text)))
+            new_confirmed = [ic for ic in frame_confirmed
+                             if ic not in confirmed_all]
             confirmed_all.update(frame_confirmed)
+
             op_model = self._get_op_model_hint(list(confirmed_all))
+            new_inferred = []
             if op_model:
                 raw = self.iccid_parser.infer_from_partial(
                     text, op_model, confirmed=confirmed_all
@@ -276,13 +289,24 @@ class Inspector:
                         continue
                     inferred_all.append((ic, serial))
                     confirmed_all.add(ic)
+                    new_inferred.append((ic, serial))
+
+            if new_confirmed or new_inferred:
+                result.log(f"    프레임 {i:03d}: "
+                           f"확인 {len(new_confirmed)}개, "
+                           f"추정 {len(new_inferred)}개 신규 발견")
+                for ic in new_confirmed:
+                    result.log(f"      ✅ 확인: {ic}")
+                for ic, serial in new_inferred:
+                    result.log(
+                        f"      ⚠️ 추정: {ic}  (시리얼 '{serial}')", "WARN"
+                    )
 
         # 임시 프레임 폴더 정리
-        if frames:
-            try:
-                shutil.rmtree(frames[0].parent, ignore_errors=True)
-            except Exception:
-                pass
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
         inferred_dedup = list({ic: s for ic, s in inferred_all}.items())
         confirmed_list = list(confirmed_all - {ic for ic, _ in inferred_dedup})

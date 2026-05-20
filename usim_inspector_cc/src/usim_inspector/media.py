@@ -13,9 +13,10 @@ from typing import List
 from .tools import tools
 
 
-def ocr_image(image_path: str) -> str:
+def ocr_image(image_path: str, is_video_frame: bool = False) -> str:
     """이미지에서 텍스트 추출. ImageMagick 전처리 → Tesseract OCR.
 
+    is_video_frame=True: MPEG 블록 노이즈 제거에 최적화된 전처리 적용.
     실패 시 빈 문자열. 외부 도구 없으면 빈 문자열.
     """
     t = tools()
@@ -29,22 +30,38 @@ def ocr_image(image_path: str) -> str:
             tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
             tmp.close()
             tmp_path = tmp.name
-            subprocess.run(
-                [t.magick, image_path,
-                 '-resize', '300%',
-                 '-colorspace', 'Gray',
-                 '-contrast-stretch', '0.15x0.05%',
-                 '-sharpen', '0x1',
-                 tmp_path],
-                check=False, capture_output=True, timeout=30
-            )
+            if is_video_frame:
+                # 비디오 프레임: MPEG 블록 노이즈 → median, 강한 대비+선명화
+                magick_cmd = [
+                    t.magick, image_path,
+                    '-resize', '400%',
+                    '-colorspace', 'Gray',
+                    '-median', '1',
+                    '-contrast-stretch', '1x0.3%',
+                    '-unsharp', '0x2+1.5+0.05',
+                    tmp_path,
+                ]
+            else:
+                magick_cmd = [
+                    t.magick, image_path,
+                    '-resize', '300%',
+                    '-colorspace', 'Gray',
+                    '-contrast-stretch', '0.15x0.05%',
+                    '-sharpen', '0x1',
+                    tmp_path,
+                ]
+            subprocess.run(magick_cmd, check=False, capture_output=True,
+                           timeout=30)
             ocr_target = tmp_path
         else:
             ocr_target = image_path
 
         # 여러 PSM 모드로 OCR 시도 → 합치기
+        psm_modes = ['6', '11', '3']
+        if is_video_frame:
+            psm_modes = ['6', '11', '3', '7']  # PSM 7: 한 줄 텍스트
         out_parts = []
-        for psm in ['6', '11', '3']:
+        for psm in psm_modes:
             r = subprocess.run(
                 [t.tesseract, ocr_target, '-', '--psm', psm,
                  '--oem', '3'],
@@ -65,29 +82,31 @@ def ocr_image(image_path: str) -> str:
                 pass
 
 
-def extract_video_frames(video_path: Path, fps: float) -> List[Path]:
-    """동영상에서 초당 fps장씩 프레임을 임시 폴더에 추출.
+def extract_video_frames(video_path: Path, fps: float,
+                         max_frames: int = 0) -> List[Path]:
+    """동영상에서 초당 fps장씩 프레임을 임시 폴더에 PNG로 추출.
+
+    PNG 무손실 포맷을 사용하여 JPEG 압축 아티팩트를 방지.
+
+    Args:
+        max_frames: 0이면 무제한. 양수이면 추출 프레임 수 상한.
 
     Returns:
         추출된 프레임 파일 경로 리스트. 호출자가 작업 후 정리해야 함.
-
-    Note:
-        임시 폴더가 함수 종료 시 사라지지 않도록 호출자가 관리할 것.
-        보통 tempfile.TemporaryDirectory 컨텍스트 안에서 호출.
     """
     t = tools()
     if not t.ffmpeg:
         return []
 
     out_dir = Path(tempfile.mkdtemp(prefix='usim_frames_'))
-    frame_pattern = str(out_dir / 'f_%03d.jpg')
+    frame_pattern = str(out_dir / 'f_%05d.png')
+    cmd = [t.ffmpeg, '-i', str(video_path), '-vf', f'fps={fps}']
+    if max_frames > 0:
+        cmd += ['-vframes', str(max_frames)]
+    cmd += [frame_pattern, '-y']
     try:
-        subprocess.run(
-            [t.ffmpeg, '-i', str(video_path), '-vf', f'fps={fps}',
-             '-q:v', '2', frame_pattern, '-y'],
-            capture_output=True, timeout=120, check=False
-        )
+        subprocess.run(cmd, capture_output=True, timeout=300, check=False)
     except Exception:
         return []
 
-    return sorted(out_dir.glob('f_*.jpg'))
+    return sorted(out_dir.glob('f_*.png'))
