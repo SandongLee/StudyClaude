@@ -1,0 +1,13 @@
+{
+  "name": "sclient",
+  "version": "0.1.0",
+  "description": "SWT SClient - PC/SC <-> WebSocket bridge for smartcard access",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "@pokusew/pcsclite": "^0.6.0"
+  }
+}

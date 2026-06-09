@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>SWT - Smart Card Bridge Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #4ade80;
+      --err: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    .status-pill {
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      background: #334155;
+      color: var(--muted);
+    }
+    .status-pill.connected { background: #14532d; color: var(--ok); }
+    .status-pill.disconnected { background: #7f1d1d; color: var(--err); }
+
+    main {
+      max-width: 960px;
+      margin: 24px auto;
+      padding: 0 24px;
+      display: grid;
+      gap: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .row { display: flex; gap: 8px; align-items: center; }
+    input[type="text"] {
+      flex: 1;
+      padding: 10px 12px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: 'Consolas', monospace;
+      font-size: 14px;
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #0c4a6e;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.1); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #475569; color: var(--text); }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      padding: 12px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: 'Consolas', monospace;
+      font-size: 13px;
+      resize: vertical;
+    }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🪪 SWT · Smart Card Bridge Console</h1>
+    <span id="status" class="status-pill disconnected">Bridge: disconnected</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. Card Reset</h2>
+      <div class="row">
+        <button id="btnReset">Card Reset</button>
+        <span class="hint">카드를 초기화하고 ATR 값을 확인합니다.</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. APDU 전송</h2>
+      <div class="row">
+        <input id="apduInput" type="text" placeholder="예: 00A4040000" value="00A4040000" />
+        <button id="btnSend">Send APDU</button>
+      </div>
+      <div class="hint">Hex 문자열로 입력하세요 (공백 무시).</div>
+    </section>
+
+    <section class="card">
+      <h2>3. 응답 로그</h2>
+      <textarea id="response" readonly placeholder="응답이 여기에 표시됩니다..."></textarea>
+      <div class="row" style="margin-top: 8px; justify-content: flex-end;">
+        <button class="secondary" id="btnClear">Clear</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const respEl = $('response');
+    let ws = null;
+    let bridgeUrl = 'ws://localhost:8081';
+
+    function log(line) {
+      const ts = new Date().toLocaleTimeString();
+      respEl.value += `[${ts}] ${line}\n`;
+      respEl.scrollTop = respEl.scrollHeight;
+    }
+
+    function setStatus(connected) {
+      statusEl.classList.toggle('connected', connected);
+      statusEl.classList.toggle('disconnected', !connected);
+      statusEl.textContent = connected ? 'Bridge: connected' : 'Bridge: disconnected';
+    }
+
+    function connect() {
+      try {
+        ws = new WebSocket(bridgeUrl);
+      } catch (e) {
+        log(`WS 생성 실패: ${e.message}`);
+        return;
+      }
+
+      ws.onopen = () => {
+        setStatus(true);
+        log(`브리지 연결됨 (${bridgeUrl})`);
+      };
+      ws.onclose = () => {
+        setStatus(false);
+        log('브리지 연결 종료. 5초 후 재시도...');
+        setTimeout(connect, 5000);
+      };
+      ws.onerror = () => {
+        log('브리지 연결 오류');
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'RESET_OK') {
+            log(`ATR: ${msg.atr}`);
+          } else if (msg.type === 'TRANSMIT_OK') {
+            log(`<= ${msg.response}  (SW=${msg.sw})`);
+          } else if (msg.type === 'ERROR') {
+            log(`ERROR: ${msg.message}`);
+          } else {
+            log(`수신: ${ev.data}`);
+          }
+        } catch {
+          log(`수신(raw): ${ev.data}`);
+        }
+      };
+    }
+
+    function send(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log('브리지가 연결되어 있지 않습니다.');
+        return;
+      }
+      ws.send(JSON.stringify(obj));
+    }
+
+    $('btnReset').addEventListener('click', () => {
+      log('=> RESET 요청');
+      send({ action: 'RESET' });
+    });
+
+    $('btnSend').addEventListener('click', () => {
+      const raw = $('apduInput').value.replace(/\s+/g, '').toUpperCase();
+      if (!/^[0-9A-F]+$/.test(raw) || raw.length % 2 !== 0) {
+        log('APDU Hex 형식이 올바르지 않습니다.');
+        return;
+      }
+      log(`=> TRANSMIT ${raw}`);
+      send({ action: 'TRANSMIT', apdu: raw });
+    });
+
+    $('btnClear').addEventListener('click', () => { respEl.value = ''; });
+
+    fetch('/api/config').then(r => r.json()).then(cfg => {
+      if (cfg.bridgeUrl) bridgeUrl = cfg.bridgeUrl;
+      connect();
+    }).catch(() => connect());
+  </script>
+</body>
+</html>

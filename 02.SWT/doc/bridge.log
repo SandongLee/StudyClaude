@@ -1,0 +1,6 @@
+[Bridge] WebSocket listening on ws://localhost:8081
+[PC/SC] reader detected: Gemplus USB Smart Card Reader 0
+[PC/SC] card present on Gemplus USB Smart Card Reader 0, ATR=3BDF9500803F87A08031E073FE211B67E2017E830F9000D2
+[Bridge] client connected
+[Bridge] client connected
+[PC/SC] connect ok, protocol=1 (type=number)

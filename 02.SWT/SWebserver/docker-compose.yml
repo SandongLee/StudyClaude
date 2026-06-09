@@ -1,0 +1,10 @@
+services:
+  swebserver:
+    build: .
+    container_name: swt-webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
