@@ -31,9 +31,14 @@
    - `@pokusew/pcsclite` 버전을 명세서의 `^1.0.3` → 실제 존재 버전 `^0.6.0`으로 수정
    - 네이티브 모듈(`build/`) 빌드 성공 (별도 VS Build Tools 불필요)
 6. 브라우저 ↔ 브리지 ↔ 카드 E2E 검증 (발견된 버그 2건 수정 — 아래 4번 항목)
-7. **Reader 관리 UI 추가** — 다중 리더 listbox + 「연결 / 연결 끊기 / Warm Reset」 버튼
-   - 브리지: `readers = Map<name, info>` 다중 리더 관리, `READERS` 푸시, `CONNECT/DISCONNECT/WARM_RESET` 액션 추가
-   - Warm Reset은 `disconnect(SCARD_RESET_CARD)` + `connect` 조합으로 구현 (`@pokusew/pcsclite` 0.6.0에 `reconnect` 미지원)
+7. **Reader 관리 UI 추가** — 다중 리더 listbox + 「연결 / Cold Reset / Warm Reset / 연결 끊기」 4버튼
+   - 브리지: `readers = Map<name, info>` 다중 리더 관리, `READERS` 푸시, `CONNECT/DISCONNECT/WARM_RESET/COLD_RESET` 액션 추가
+   - **세 가지 동작을 PC/SC 호출 시퀀스로 명확히 분리**
+     - 연결 = `reader.connect()` 한 번 (단순 attach)
+     - Warm Reset = `disconnect(SCARD_RESET_CARD)` + `connect` — 카드 전원 유지, 논리적 리셋
+     - Cold Reset = `disconnect(SCARD_UNPOWER_CARD)` + `connect` — 카드 전원 사이클(off → on)
+   - `@pokusew/pcsclite` 0.6.0에 `reconnect` 미지원이라 두 단계 호출로 구현
+   - UI: 두 카드(Reader 선택 / Card Reset)를 한 카드(「1. Reader 선택 / 카드 제어」)로 통합, 버튼 순서 「연결 → Cold Reset → Warm Reset → 연결 끊기」 + 색상 분리(blue/cyan/orange/red)
 8. **Auto Get Response (61xx/6Cxx 자동 chained APDU)** — 응답 로그 헤더에 체크박스
    - 체크 시: `61xx` → `<CLA>C00000<xx>` GET RESPONSE, `6Cxx` → 마지막 APDU의 Le만 교체 재전송. 안전장치 `AUTO_CHAIN_MAX=8`.
 9. **SECURE 모드 (HTTPS + wss + Origin 화이트리스트)** — §8 참조
@@ -60,7 +65,7 @@ SWT/
 │   ├── .dockerignore
 │   ├── package.json
 │   ├── server.js            # SECURE=1 시 HTTPS, /api/config 동적 bridgeUrl
-│   ├── public/index.html    # Reader 선택 + Card Reset + APDU + Auto Get Response
+│   ├── public/index.html    # 1) Reader 선택/카드 제어, 2) APDU 전송, 3) 응답 로그(Auto Get Response)
 │   └── node_modules/
 ├── SClient/
 │   ├── package.json         # ws, @pokusew/pcsclite, selfsigned
@@ -101,13 +106,16 @@ SWT/
 | `0084000008` (GET CHALLENGE 8B) | `6D00` | `6D00` | 이 카드 미지원 INS |
 | `00A40400023F00` (SELECT MF) | `6A82` | `6A82` | File not found |
 
-#### 4-B. Reader 관리 UI 동작
-| 액션 | 결과 |
-|---|---|
-| `CONNECT` (listbox 선택 후) | `연결됨: Gemplus USB Smart Card Reader 0 (ATR=3BDF95…0076)` |
-| `WARM_RESET` | `Warm Reset OK: ... (ATR=3BDF95…0076)` |
-| `TRANSMIT 00A4040000` | `<= 6112 (SW=6112)` |
-| `DISCONNECT` | `연결 끊김: Gemplus USB Smart Card Reader 0` |
+#### 4-B. Reader 관리 UI 동작 (통합된 「1. Reader 선택 / 카드 제어」 박스)
+| 액션 | 브리지 PC/SC 호출 | UI 로그 |
+|---|---|---|
+| `CONNECT` | `reader.connect()` | `연결됨: Gemplus USB Smart Card Reader 0 (ATR=3BDF95…0076)` |
+| `COLD_RESET` | `disconnect(SCARD_UNPOWER_CARD)` + `connect` | `Cold Reset OK: ... (ATR=3BDF95…0076)` (브리지 로그: `cold reset: power cycled`) |
+| `WARM_RESET` | `disconnect(SCARD_RESET_CARD)` + `connect` | `Warm Reset OK: ... (ATR=3BDF95…0076)` |
+| `TRANSMIT 00A4040000` | `reader.transmit(...)` | `<= 6112 (SW=6112)` |
+| `DISCONNECT` | `disconnect(SCARD_LEAVE_CARD)` | `연결 끊김: Gemplus USB Smart Card Reader 0` |
+
+> 같은 카드라 ATR 값은 동일하게 회신되지만, 브리지의 PC/SC 호출 시퀀스가 명확히 분리되어 있어 디버깅 시 의도를 추적할 수 있습니다.
 
 #### 4-C. Auto Get Response (체크박스 ON)
 입력: `00A4040000`
@@ -203,22 +211,30 @@ http://localhost:8080
 
 ### 5-4. 사용 흐름
 
-#### 권장 흐름 (Reader 명시적 관리)
-1. **0. Reader 선택** 카드의 리스트박스에서 리더기 선택
-   - `💳` 표시 = 카드 삽입됨, `∅` = 카드 없음, `✓연결됨` = 현재 세션
-2. **「연결」** 클릭 → 응답 로그에 `연결됨: <reader> (ATR=...)` 출력
-3. **2. APDU 전송** 입력창에 헥사 문자열 입력 (기본값 `00A4040000`)
-4. **「Send APDU」** 클릭 → `<= 응답Hex (SW=상태워드)` 출력
-5. **「Warm Reset」** — 세션을 유지한 채 카드만 다시 리셋 (새 ATR 확인)
-6. **「연결 끊기」** — 세션 종료
-7. **응답 로그 우상단 「Auto Get Response」** 체크 시 `61xx`/`6Cxx`에 대해 자동 후속 APDU 송신
+#### 화면 구성 (3개 카드)
+1. **1. Reader 선택 / 카드 제어** — 리스트박스 + 4개 버튼(연결 / Cold Reset / Warm Reset / 연결 끊기)
+2. **2. APDU 전송** — Hex 입력창 + Send APDU
+3. **3. 응답 로그** — Auto Get Response 토글 + textarea + Clear
 
-#### 단순 흐름 (Card Reset 단일 버튼)
-- **`Card Reset`** 클릭 — 선택된 리더기에 cold connect + ATR 확인 (`CONNECT` 와 동등 결과)
-- 이후 동일하게 APDU 전송 사용 가능
+#### 버튼 의미와 색
+| 버튼 | 색 | 의미 |
+|---|---|---|
+| 연결 | 청색 | `reader.connect()` — 단순 세션 attach |
+| Cold Reset | cyan | 카드 전원 사이클(off → on), ATR 새로 확인 |
+| Warm Reset | 주황 | 전원 유지 + 논리적 리셋 |
+| 연결 끊기 | 빨강 | 세션 해제 |
+
+#### 사용 흐름 예시
+1. 리스트박스에서 리더기 선택
+   - `💳` = 카드 있음, `∅` = 없음, `✓연결됨` = 현재 세션
+2. **「연결」** → `연결됨: <reader> (ATR=...)`
+3. APDU 입력창에 Hex 입력 (기본값 `00A4040000`) → **「Send APDU」**
+4. 필요 시 **「Cold Reset」** 또는 **「Warm Reset」** 으로 카드 상태 갱신
+5. **응답 로그 우상단 「Auto Get Response」** 체크 시 `61xx`/`6Cxx`에 대해 자동 후속 APDU
+6. 종료 시 **「연결 끊기」**
 
 #### 기타
-- **`Clear`** 버튼으로 로그 초기화
+- **「Clear」** 로 로그 초기화
 - 리더기/카드 hot-plug는 자동 감지되어 listbox에 반영됨
 
 ---

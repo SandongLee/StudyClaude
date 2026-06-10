@@ -86,6 +86,7 @@
     button.secondary { background: #475569; color: var(--text); }
     button.warn { background: #f59e0b; color: #422006; }
     button.danger { background: #ef4444; color: #fff; }
+    button.cool { background: #06b6d4; color: #042e36; }
 
     select {
       width: 100%;
@@ -141,22 +142,16 @@
 
   <main>
     <section class="card">
-      <h2>0. Reader 선택</h2>
+      <h2>1. Reader 선택 / 카드 제어</h2>
       <select id="readerSelect" size="3"><option disabled>(리더기 검색 중...)</option></select>
       <div class="row" style="margin-top: 10px;">
         <button id="btnConnect">연결</button>
-        <button id="btnDisconnect" class="danger">연결 끊기</button>
+        <button id="btnReset" class="cool">Cold Reset</button>
         <button id="btnWarmReset" class="warn">Warm Reset</button>
-        <span class="hint" id="readerHint">리더기를 선택한 뒤 「연결」을 누르세요.</span>
+        <button id="btnDisconnect" class="danger">연결 끊기</button>
       </div>
-    </section>
-
-    <section class="card">
-      <h2>1. Card Reset</h2>
-      <div class="row">
-        <button id="btnReset">Card Reset</button>
-        <span class="hint">선택된 리더기로 cold connect 후 ATR 값을 확인합니다.</span>
-      </div>
+      <div class="hint" id="readerHint" style="margin-top: 8px;">리더기를 선택한 뒤 「연결」을 누르세요.</div>
+      <div class="hint" style="margin-top: 4px;">Cold Reset = 카드 전원 사이클 / Warm Reset = 논리적 리셋(전원 유지)</div>
     </section>
 
     <section class="card">
@@ -236,6 +231,8 @@
             log(`연결 끊김: ${msg.reader || '(없음)'}`);
           } else if (msg.type === 'WARM_RESET_OK') {
             log(`Warm Reset OK: ${msg.reader} (ATR=${msg.atr || 'n/a'})`);
+          } else if (msg.type === 'COLD_RESET_OK') {
+            log(`Cold Reset OK: ${msg.reader} (ATR=${msg.atr || 'n/a'})`);
           } else if (msg.type === 'RESET_OK') {
             log(`ATR: ${msg.atr}`);
           } else if (msg.type === 'TRANSMIT_OK') {
@@ -349,8 +346,8 @@
 
     $('btnReset').addEventListener('click', () => {
       const name = selectedReader();
-      log(`=> RESET${name ? ' ' + name : ''}`);
-      send(name ? { action: 'RESET', reader: name } : { action: 'RESET' });
+      log(`=> COLD_RESET${name ? ' ' + name : ''}`);
+      send(name ? { action: 'COLD_RESET', reader: name } : { action: 'COLD_RESET' });
     });
 
     $('btnSend').addEventListener('click', () => {

@@ -133,6 +133,44 @@ function connectReader(name, share = 'shared') {
   });
 }
 
+async function coldResetReader(name) {
+  const info = readers.get(name);
+  if (!info) throw new Error(`리더기를 찾을 수 없습니다: ${name}`);
+  const reader = info.reader;
+
+  if (session.name && session.name !== name) {
+    const other = readers.get(session.name);
+    if (other) {
+      await new Promise((res) => other.reader.disconnect(other.reader.SCARD_LEAVE_CARD, () => res()));
+    }
+    session.name = null;
+    session.protocol = null;
+  }
+
+  if (session.name !== name) {
+    await new Promise((res, rej) => {
+      const protos = reader.SCARD_PROTOCOL_T0 | reader.SCARD_PROTOCOL_T1;
+      reader.connect({ share_mode: reader.SCARD_SHARE_SHARED, protocol: protos }, (err, proto) => {
+        if (err) return rej(err);
+        session.name = name;
+        session.protocol = typeof proto === 'number' ? proto : reader.SCARD_PROTOCOL_T0;
+        res();
+      });
+    });
+  }
+
+  await new Promise((res, rej) => {
+    reader.disconnect(reader.SCARD_UNPOWER_CARD, (err) => err ? rej(err) : res());
+  });
+  console.log(`[PC/SC] cold reset: power cycled on ${name}`);
+  session.name = null;
+  session.protocol = null;
+
+  const result = await connectReader(name);
+  console.log(`[PC/SC] cold reset done on ${name}, ATR=${result.atr || 'n/a'}`);
+  return result;
+}
+
 function warmResetReader() {
   return new Promise((resolve, reject) => {
     if (!session.name) return reject(new Error('연결된 리더기가 없습니다. 먼저 연결하세요.'));
@@ -256,11 +294,12 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'WARM_RESET_OK', ...r }));
           break;
         }
-        case 'RESET': {
+        case 'RESET':
+        case 'COLD_RESET': {
           const name = pickName(msg.reader);
           if (!name) throw new Error('연결 가능한 리더기가 없습니다.');
-          const r = await connectReader(name, msg.share);
-          ws.send(JSON.stringify({ type: 'RESET_OK', reader: r.reader, atr: r.atr }));
+          const r = await coldResetReader(name);
+          ws.send(JSON.stringify({ type: 'COLD_RESET_OK', reader: r.reader, atr: r.atr }));
           break;
         }
         case 'TRANSMIT': {
