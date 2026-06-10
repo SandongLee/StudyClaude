@@ -1,54 +1,102 @@
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
 const { WebSocketServer } = require('ws');
 const pcsclite = require('@pokusew/pcsclite');
 
-const WS_PORT = 8081;
+const SECURE = process.env.SECURE === '1' || process.env.SECURE === 'true';
+const WS_PORT = parseInt(process.env.BRIDGE_PORT || (SECURE ? '8444' : '8081'), 10);
+const SWEB_PORT = process.env.SWEB_PORT || (SECURE ? '8443' : '8080');
+const DEFAULT_ORIGIN = `${SECURE ? 'https' : 'http'}://localhost:${SWEB_PORT}`;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || DEFAULT_ORIGIN)
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-const state = {
-  readerName: null,
-  reader: null,
-  protocol: null,
-  connected: false,
-  atr: null
+function verifyOrigin(origin) {
+  if (!origin) return !SECURE;
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+function verifyClient(info, cb) {
+  const origin = info.origin || info.req.headers.origin || '';
+  if (verifyOrigin(origin)) return cb(true);
+  console.warn(`[Bridge] origin rejected: "${origin}"`);
+  cb(false, 403, 'origin not allowed');
+}
+
+const readers = new Map();
+
+const session = {
+  name: null,
+  protocol: null
 };
 
 const pcsc = pcsclite();
+let wss = null;
+
+function broadcast(obj) {
+  if (!wss) return;
+  const msg = JSON.stringify(obj);
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+}
+
+function readersSnapshot() {
+  return Array.from(readers.entries()).map(([name, info]) => ({
+    name,
+    hasCard: !!info.hasCard,
+    atr: info.atr || null,
+    connected: session.name === name
+  }));
+}
+
+function pushReaders() {
+  broadcast({ type: 'READERS', readers: readersSnapshot() });
+}
 
 pcsc.on('reader', (reader) => {
   console.log(`[PC/SC] reader detected: ${reader.name}`);
-  state.readerName = reader.name;
-  state.reader = reader;
+  readers.set(reader.name, { reader, hasCard: false, atr: null });
+  pushReaders();
 
   reader.on('error', (err) => {
     console.error(`[PC/SC] reader error (${reader.name}): ${err.message}`);
   });
 
   reader.on('status', (status) => {
+    const info = readers.get(reader.name);
+    if (!info) return;
     const changes = reader.state ^ status.state;
     if (!changes) return;
 
     if ((changes & reader.SCARD_STATE_EMPTY) && (status.state & reader.SCARD_STATE_EMPTY)) {
       console.log(`[PC/SC] card removed from ${reader.name}`);
-      if (state.connected) {
+      info.hasCard = false;
+      info.atr = null;
+      if (session.name === reader.name) {
         reader.disconnect(reader.SCARD_LEAVE_CARD, () => {});
-        state.connected = false;
-        state.protocol = null;
+        session.name = null;
+        session.protocol = null;
       }
+      pushReaders();
     } else if ((changes & reader.SCARD_STATE_PRESENT) && (status.state & reader.SCARD_STATE_PRESENT)) {
+      info.hasCard = true;
       if (status.atr && status.atr.length) {
-        state.atr = Buffer.from(status.atr).toString('hex').toUpperCase();
+        info.atr = Buffer.from(status.atr).toString('hex').toUpperCase();
       }
-      console.log(`[PC/SC] card present on ${reader.name}, ATR=${state.atr || 'n/a'}`);
+      console.log(`[PC/SC] card present on ${reader.name}, ATR=${info.atr || 'n/a'}`);
+      pushReaders();
     }
   });
 
   reader.on('end', () => {
     console.log(`[PC/SC] reader removed: ${reader.name}`);
-    if (state.readerName === reader.name) {
-      state.readerName = null;
-      state.reader = null;
-      state.protocol = null;
-      state.connected = false;
+    if (session.name === reader.name) {
+      session.name = null;
+      session.protocol = null;
     }
+    readers.delete(reader.name);
+    pushReaders();
   });
 });
 
@@ -56,32 +104,91 @@ pcsc.on('error', (err) => {
   console.error(`[PC/SC] service error: ${err.message}`);
 });
 
-function connectCard() {
+function pickName(requested) {
+  if (requested && readers.has(requested)) return requested;
+  if (session.name && readers.has(session.name)) return session.name;
+  const first = readers.keys().next().value;
+  return first || null;
+}
+
+function connectReader(name, share = 'shared') {
   return new Promise((resolve, reject) => {
-    if (!state.reader) {
-      return reject(new Error('연결된 리더기가 없습니다.'));
-    }
-    const reader = state.reader;
-    const share = reader.SCARD_SHARE_SHARED;
+    const info = readers.get(name);
+    if (!info) return reject(new Error(`리더기를 찾을 수 없습니다: ${name}`));
+    const reader = info.reader;
+    const shareMode = share === 'exclusive'
+      ? reader.SCARD_SHARE_EXCLUSIVE
+      : reader.SCARD_SHARE_SHARED;
     const protos = reader.SCARD_PROTOCOL_T0 | reader.SCARD_PROTOCOL_T1;
 
-    reader.connect({ share_mode: share, protocol: protos }, (err, protocol) => {
+    reader.connect({ share_mode: shareMode, protocol: protos }, (err, protocol) => {
       if (err) return reject(err);
-      console.log(`[PC/SC] connect ok, protocol=${protocol} (type=${typeof protocol})`);
-      state.protocol = typeof protocol === 'number' ? protocol : reader.SCARD_PROTOCOL_T0;
-      state.connected = true;
-      resolve({ atr: state.atr });
+      const proto = typeof protocol === 'number' ? protocol : reader.SCARD_PROTOCOL_T0;
+      session.name = name;
+      session.protocol = proto;
+      console.log(`[PC/SC] connected: ${name}, protocol=${proto}`);
+      pushReaders();
+      resolve({ reader: name, atr: info.atr, protocol: proto });
+    });
+  });
+}
+
+function warmResetReader() {
+  return new Promise((resolve, reject) => {
+    if (!session.name) return reject(new Error('연결된 리더기가 없습니다. 먼저 연결하세요.'));
+    const info = readers.get(session.name);
+    if (!info) return reject(new Error('세션 리더가 더 이상 존재하지 않습니다.'));
+    const reader = info.reader;
+    const name = session.name;
+    const protos = reader.SCARD_PROTOCOL_T0 | reader.SCARD_PROTOCOL_T1;
+
+    reader.disconnect(reader.SCARD_RESET_CARD, (err) => {
+      if (err) return reject(err);
+      reader.connect({ share_mode: reader.SCARD_SHARE_SHARED, protocol: protos }, (err2, protocol) => {
+        if (err2) {
+          session.name = null;
+          session.protocol = null;
+          pushReaders();
+          return reject(err2);
+        }
+        const proto = typeof protocol === 'number' ? protocol : reader.SCARD_PROTOCOL_T0;
+        session.protocol = proto;
+        console.log(`[PC/SC] warm reset done on ${name}, protocol=${proto}`);
+        pushReaders();
+        resolve({ reader: name, atr: info.atr, protocol: proto });
+      });
+    });
+  });
+}
+
+function disconnectReader() {
+  return new Promise((resolve, reject) => {
+    if (!session.name) return resolve({ reader: null });
+    const info = readers.get(session.name);
+    const name = session.name;
+    if (!info) {
+      session.name = null;
+      session.protocol = null;
+      return resolve({ reader: name });
+    }
+    info.reader.disconnect(info.reader.SCARD_LEAVE_CARD, (err) => {
+      if (err) return reject(err);
+      console.log(`[PC/SC] disconnected: ${name}`);
+      session.name = null;
+      session.protocol = null;
+      pushReaders();
+      resolve({ reader: name });
     });
   });
 }
 
 function transmitApdu(hex) {
   return new Promise((resolve, reject) => {
-    if (!state.reader || !state.connected) {
-      return reject(new Error('카드가 연결되어 있지 않습니다. 먼저 RESET을 실행하세요.'));
-    }
+    if (!session.name) return reject(new Error('카드가 연결되어 있지 않습니다. 먼저 연결하세요.'));
+    const info = readers.get(session.name);
+    if (!info) return reject(new Error('세션 리더가 더 이상 존재하지 않습니다.'));
     const cmd = Buffer.from(hex, 'hex');
-    state.reader.transmit(cmd, 512, state.protocol, (err, data) => {
+    info.reader.transmit(cmd, 512, session.protocol, (err, data) => {
       if (err) return reject(err);
       const respHex = data.toString('hex').toUpperCase();
       const sw = respHex.slice(-4);
@@ -91,11 +198,32 @@ function transmitApdu(hex) {
   });
 }
 
-const wss = new WebSocketServer({ port: WS_PORT });
-console.log(`[Bridge] WebSocket listening on ws://localhost:${WS_PORT}`);
+if (SECURE) {
+  const certDir = path.resolve(__dirname, '..', 'certs');
+  const keyPath = path.join(certDir, 'server.key');
+  const crtPath = path.join(certDir, 'server.crt');
+  if (!fs.existsSync(keyPath) || !fs.existsSync(crtPath)) {
+    console.error(`[Bridge] 인증서 없음: ${certDir}\n먼저 "node gen-cert.js"를 실행하세요.`);
+    process.exit(1);
+  }
+  const server = https.createServer({
+    key: fs.readFileSync(keyPath),
+    cert: fs.readFileSync(crtPath)
+  });
+  wss = new WebSocketServer({ server, verifyClient });
+  server.listen(WS_PORT, () => {
+    console.log(`[Bridge] WSS listening on wss://localhost:${WS_PORT}`);
+    console.log(`[Bridge] allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+  });
+} else {
+  wss = new WebSocketServer({ port: WS_PORT, verifyClient });
+  console.log(`[Bridge] WS listening on ws://localhost:${WS_PORT}`);
+  console.log(`[Bridge] allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+}
 
 wss.on('connection', (ws) => {
   console.log('[Bridge] client connected');
+  ws.send(JSON.stringify({ type: 'READERS', readers: readersSnapshot() }));
 
   ws.on('message', async (raw) => {
     let msg;
@@ -106,17 +234,43 @@ wss.on('connection', (ws) => {
     }
 
     try {
-      if (msg.action === 'RESET') {
-        const result = await connectCard();
-        ws.send(JSON.stringify({ type: 'RESET_OK', reader: state.readerName, atr: result.atr }));
-      } else if (msg.action === 'TRANSMIT') {
-        if (typeof msg.apdu !== 'string') {
-          throw new Error('apdu (hex string) 필드가 필요합니다.');
+      switch (msg.action) {
+        case 'LIST_READERS': {
+          ws.send(JSON.stringify({ type: 'READERS', readers: readersSnapshot() }));
+          break;
         }
-        const result = await transmitApdu(msg.apdu);
-        ws.send(JSON.stringify({ type: 'TRANSMIT_OK', ...result }));
-      } else {
-        ws.send(JSON.stringify({ type: 'ERROR', message: `unknown action: ${msg.action}` }));
+        case 'CONNECT': {
+          const name = pickName(msg.reader);
+          if (!name) throw new Error('연결 가능한 리더기가 없습니다.');
+          const r = await connectReader(name, msg.share);
+          ws.send(JSON.stringify({ type: 'CONNECT_OK', ...r }));
+          break;
+        }
+        case 'DISCONNECT': {
+          const r = await disconnectReader();
+          ws.send(JSON.stringify({ type: 'DISCONNECT_OK', ...r }));
+          break;
+        }
+        case 'WARM_RESET': {
+          const r = await warmResetReader();
+          ws.send(JSON.stringify({ type: 'WARM_RESET_OK', ...r }));
+          break;
+        }
+        case 'RESET': {
+          const name = pickName(msg.reader);
+          if (!name) throw new Error('연결 가능한 리더기가 없습니다.');
+          const r = await connectReader(name, msg.share);
+          ws.send(JSON.stringify({ type: 'RESET_OK', reader: r.reader, atr: r.atr }));
+          break;
+        }
+        case 'TRANSMIT': {
+          if (typeof msg.apdu !== 'string') throw new Error('apdu (hex string) 필드가 필요합니다.');
+          const result = await transmitApdu(msg.apdu);
+          ws.send(JSON.stringify({ type: 'TRANSMIT_OK', ...result }));
+          break;
+        }
+        default:
+          ws.send(JSON.stringify({ type: 'ERROR', message: `unknown action: ${msg.action}` }));
       }
     } catch (err) {
       console.error(`[Bridge] action error: ${err.message}`);
@@ -130,9 +284,12 @@ wss.on('connection', (ws) => {
 process.on('SIGINT', () => {
   console.log('\n[Bridge] shutting down...');
   wss.close();
-  if (state.reader && state.connected) {
-    state.reader.disconnect(state.reader.SCARD_LEAVE_CARD, () => process.exit(0));
-  } else {
-    process.exit(0);
+  if (session.name) {
+    const info = readers.get(session.name);
+    if (info) {
+      info.reader.disconnect(info.reader.SCARD_LEAVE_CARD, () => process.exit(0));
+      return;
+    }
   }
+  process.exit(0);
 });

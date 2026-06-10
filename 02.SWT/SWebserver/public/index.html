@@ -84,6 +84,21 @@
     button:hover { filter: brightness(1.1); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.secondary { background: #475569; color: var(--text); }
+    button.warn { background: #f59e0b; color: #422006; }
+    button.danger { background: #ef4444; color: #fff; }
+
+    select {
+      width: 100%;
+      padding: 8px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: 'Consolas', monospace;
+      font-size: 13px;
+    }
+    select:focus { outline: 1px solid var(--accent); }
+    select option { padding: 4px; }
 
     textarea {
       width: 100%;
@@ -98,6 +113,24 @@
       resize: vertical;
     }
     .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .log-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin: 0 0 12px;
+    }
+    .log-head h2 { margin: 0; }
+    .toggle {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      cursor: pointer;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .toggle input { accent-color: var(--accent); margin: 0; }
   </style>
 </head>
 <body>
@@ -108,10 +141,21 @@
 
   <main>
     <section class="card">
+      <h2>0. Reader 선택</h2>
+      <select id="readerSelect" size="3"><option disabled>(리더기 검색 중...)</option></select>
+      <div class="row" style="margin-top: 10px;">
+        <button id="btnConnect">연결</button>
+        <button id="btnDisconnect" class="danger">연결 끊기</button>
+        <button id="btnWarmReset" class="warn">Warm Reset</button>
+        <span class="hint" id="readerHint">리더기를 선택한 뒤 「연결」을 누르세요.</span>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>1. Card Reset</h2>
       <div class="row">
         <button id="btnReset">Card Reset</button>
-        <span class="hint">카드를 초기화하고 ATR 값을 확인합니다.</span>
+        <span class="hint">선택된 리더기로 cold connect 후 ATR 값을 확인합니다.</span>
       </div>
     </section>
 
@@ -125,7 +169,13 @@
     </section>
 
     <section class="card">
-      <h2>3. 응답 로그</h2>
+      <div class="log-head">
+        <h2>3. 응답 로그</h2>
+        <label class="toggle">
+          <input type="checkbox" id="autoGetResp" />
+          Auto Get Response (61xx / 6Cxx)
+        </label>
+      </div>
       <textarea id="response" readonly placeholder="응답이 여기에 표시됩니다..."></textarea>
       <div class="row" style="margin-top: 8px; justify-content: flex-end;">
         <button class="secondary" id="btnClear">Clear</button>
@@ -139,6 +189,9 @@
     const respEl = $('response');
     let ws = null;
     let bridgeUrl = 'ws://localhost:8081';
+    let lastApdu = null;
+    let autoChain = 0;
+    const AUTO_CHAIN_MAX = 8;
 
     function log(line) {
       const ts = new Date().toLocaleTimeString();
@@ -175,10 +228,19 @@
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.type === 'RESET_OK') {
+          if (msg.type === 'READERS') {
+            renderReaders(msg.readers || []);
+          } else if (msg.type === 'CONNECT_OK') {
+            log(`연결됨: ${msg.reader} (ATR=${msg.atr || 'n/a'})`);
+          } else if (msg.type === 'DISCONNECT_OK') {
+            log(`연결 끊김: ${msg.reader || '(없음)'}`);
+          } else if (msg.type === 'WARM_RESET_OK') {
+            log(`Warm Reset OK: ${msg.reader} (ATR=${msg.atr || 'n/a'})`);
+          } else if (msg.type === 'RESET_OK') {
             log(`ATR: ${msg.atr}`);
           } else if (msg.type === 'TRANSMIT_OK') {
             log(`<= ${msg.response}  (SW=${msg.sw})`);
+            maybeAutoGetResponse(msg);
           } else if (msg.type === 'ERROR') {
             log(`ERROR: ${msg.message}`);
           } else {
@@ -190,6 +252,76 @@
       };
     }
 
+    function renderReaders(list) {
+      const sel = $('readerSelect');
+      const prev = sel.value;
+      sel.innerHTML = '';
+      if (!list.length) {
+        const opt = document.createElement('option');
+        opt.textContent = '(연결 가능한 리더기가 없습니다)';
+        opt.disabled = true;
+        sel.appendChild(opt);
+        $('readerHint').textContent = '리더기를 USB에 연결한 뒤 잠시 기다리세요.';
+        return;
+      }
+      for (const r of list) {
+        const opt = document.createElement('option');
+        const cardMark = r.hasCard ? '💳' : '∅';
+        const connMark = r.connected ? ' ✓연결됨' : '';
+        opt.value = r.name;
+        opt.textContent = `${cardMark} ${r.name}${connMark}`;
+        sel.appendChild(opt);
+      }
+      if (prev && list.some(r => r.name === prev)) {
+        sel.value = prev;
+      } else {
+        const conn = list.find(r => r.connected);
+        sel.value = conn ? conn.name : list[0].name;
+      }
+      const cur = list.find(r => r.connected);
+      $('readerHint').textContent = cur
+        ? `현재 연결: ${cur.name}`
+        : '리더기를 선택한 뒤 「연결」을 누르세요.';
+    }
+
+    function selectedReader() {
+      const sel = $('readerSelect');
+      const v = sel.value;
+      if (!v || sel.selectedOptions[0]?.disabled) return null;
+      return v;
+    }
+
+    function sendApdu(hex, auto) {
+      lastApdu = hex.toUpperCase();
+      log(`${auto ? '[auto] ' : ''}=> TRANSMIT ${lastApdu}`);
+      send({ action: 'TRANSMIT', apdu: lastApdu });
+    }
+
+    function maybeAutoGetResponse(msg) {
+      if (!$('autoGetResp').checked) { autoChain = 0; return; }
+      const sw = (msg.sw || '').toUpperCase();
+      if (autoChain >= AUTO_CHAIN_MAX) {
+        log(`[auto] chain limit(${AUTO_CHAIN_MAX}) 도달 - 중단`);
+        autoChain = 0;
+        return;
+      }
+      if (sw.startsWith('61')) {
+        const le = sw.slice(2);
+        const cla = (lastApdu || '00').slice(0, 2);
+        const next = `${cla}C00000${le}`;
+        autoChain++;
+        setTimeout(() => sendApdu(next, true), 30);
+      } else if (sw.startsWith('6C')) {
+        if (!lastApdu || lastApdu.length < 10) { autoChain = 0; return; }
+        const le = sw.slice(2);
+        const next = lastApdu.slice(0, -2) + le;
+        autoChain++;
+        setTimeout(() => sendApdu(next, true), 30);
+      } else {
+        autoChain = 0;
+      }
+    }
+
     function send(obj) {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         log('브리지가 연결되어 있지 않습니다.');
@@ -198,19 +330,37 @@
       ws.send(JSON.stringify(obj));
     }
 
+    $('btnConnect').addEventListener('click', () => {
+      const name = selectedReader();
+      if (!name) { log('리더기를 선택하세요.'); return; }
+      log(`=> CONNECT ${name}`);
+      send({ action: 'CONNECT', reader: name });
+    });
+
+    $('btnDisconnect').addEventListener('click', () => {
+      log('=> DISCONNECT');
+      send({ action: 'DISCONNECT' });
+    });
+
+    $('btnWarmReset').addEventListener('click', () => {
+      log('=> WARM_RESET');
+      send({ action: 'WARM_RESET' });
+    });
+
     $('btnReset').addEventListener('click', () => {
-      log('=> RESET 요청');
-      send({ action: 'RESET' });
+      const name = selectedReader();
+      log(`=> RESET${name ? ' ' + name : ''}`);
+      send(name ? { action: 'RESET', reader: name } : { action: 'RESET' });
     });
 
     $('btnSend').addEventListener('click', () => {
       const raw = $('apduInput').value.replace(/\s+/g, '').toUpperCase();
+      autoChain = 0;
       if (!/^[0-9A-F]+$/.test(raw) || raw.length % 2 !== 0) {
         log('APDU Hex 형식이 올바르지 않습니다.');
         return;
       }
-      log(`=> TRANSMIT ${raw}`);
-      send({ action: 'TRANSMIT', apdu: raw });
+      sendApdu(raw, false);
     });
 
     $('btnClear').addEventListener('click', () => { respEl.value = ''; });

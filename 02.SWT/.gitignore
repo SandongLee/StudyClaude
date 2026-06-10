@@ -3,3 +3,6 @@ npm-debug.log
 .env
 .DS_Store
 Thumbs.db
+certs/
+doc/bridge*.log
+doc/sweb*.log

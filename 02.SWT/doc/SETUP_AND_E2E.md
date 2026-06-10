@@ -30,8 +30,16 @@
 5. 의존성 설치
    - `@pokusew/pcsclite` 버전을 명세서의 `^1.0.3` → 실제 존재 버전 `^0.6.0`으로 수정
    - 네이티브 모듈(`build/`) 빌드 성공 (별도 VS Build Tools 불필요)
-6. 브라우저 ↔ 브리지 ↔ 카드 E2E 검증
-   - 발견된 버그 2건 수정 (아래 4번 항목)
+6. 브라우저 ↔ 브리지 ↔ 카드 E2E 검증 (발견된 버그 2건 수정 — 아래 4번 항목)
+7. **Reader 관리 UI 추가** — 다중 리더 listbox + 「연결 / 연결 끊기 / Warm Reset」 버튼
+   - 브리지: `readers = Map<name, info>` 다중 리더 관리, `READERS` 푸시, `CONNECT/DISCONNECT/WARM_RESET` 액션 추가
+   - Warm Reset은 `disconnect(SCARD_RESET_CARD)` + `connect` 조합으로 구현 (`@pokusew/pcsclite` 0.6.0에 `reconnect` 미지원)
+8. **Auto Get Response (61xx/6Cxx 자동 chained APDU)** — 응답 로그 헤더에 체크박스
+   - 체크 시: `61xx` → `<CLA>C00000<xx>` GET RESPONSE, `6Cxx` → 마지막 APDU의 Le만 교체 재전송. 안전장치 `AUTO_CHAIN_MAX=8`.
+9. **SECURE 모드 (HTTPS + wss + Origin 화이트리스트)** — §8 참조
+   - `selfsigned` 기반 `gen-cert.js`로 self-signed 인증서 자동 발급
+   - 브리지·서버 모두 `SECURE=1` 환경변수로 토글, `/api/config` 가 자동으로 `wss` URL 반환
+   - `verifyClient`로 Origin 검증 — SECURE 모드에서는 Origin 헤더 없는 연결도 거부
 
 ---
 
@@ -43,25 +51,29 @@ SWT/
 ├── .gitignore
 ├── .claude/
 │   └── launch.json          # Preview MCP용 서버 설정
+├── certs/                   # (gitignore) gen-cert.js로 자동 생성
+│   ├── server.key
+│   └── server.crt
 ├── SWebserver/
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   ├── .dockerignore
 │   ├── package.json
-│   ├── server.js
-│   ├── public/index.html
-│   └── node_modules/        # 로컬 실행용
+│   ├── server.js            # SECURE=1 시 HTTPS, /api/config 동적 bridgeUrl
+│   ├── public/index.html    # Reader 선택 + Card Reset + APDU + Auto Get Response
+│   └── node_modules/
 ├── SClient/
-│   ├── package.json
-│   ├── bridge.js
-│   ├── smoke_e2e.js         # WebSocket 자가 검증 스크립트
+│   ├── package.json         # ws, @pokusew/pcsclite, selfsigned
+│   ├── bridge.js            # SECURE=1 시 wss, 항상 Origin 화이트리스트
+│   ├── gen-cert.js          # self-signed 인증서 발급
+│   ├── smoke_e2e.js         # 평문 WS RESET/TRANSMIT 자가 검증
+│   ├── smoke_origin.js      # Origin 화이트리스트 검증
+│   ├── smoke_wss.js         # wss 핸드셰이크 + Origin 검증
 │   ├── README.md
 │   └── node_modules/
 └── doc/
     ├── SWT_spec_original.pdf
-    ├── SETUP_AND_E2E.md     # 본 문서
-    ├── bridge.log
-    └── bridge.err.log
+    └── SETUP_AND_E2E.md     # 본 문서
 ```
 
 ---
@@ -81,12 +93,43 @@ SWT/
 
 ### 검증 결과 (실측)
 
+#### 4-A. 초기 평문 모드 (Card Reset 단독)
 | 송신 APDU | 수신 응답 | 상태 워드 | 의미 |
 |---|---|---|---|
 | (RESET) | ATR `3BDF9500…9000D2` | – | 카드 정상 리셋 |
-| `00A4040000` (SELECT, empty AID) | `6189` | `6189` | 정상 처리, 응답 데이터 137바이트 사용 가능 |
-| `0084000008` (GET CHALLENGE 8B) | `6D00` | `6D00` | 이 카드 미지원 INS (정상 카드 응답) |
-| `00A40400023F00` (SELECT MF) | `6A82` | `6A82` | File not found (카드별 응답) |
+| `00A4040000` (SELECT, empty AID) | `6189` | `6189` | 정상 처리, 응답 137B 사용 가능 |
+| `0084000008` (GET CHALLENGE 8B) | `6D00` | `6D00` | 이 카드 미지원 INS |
+| `00A40400023F00` (SELECT MF) | `6A82` | `6A82` | File not found |
+
+#### 4-B. Reader 관리 UI 동작
+| 액션 | 결과 |
+|---|---|
+| `CONNECT` (listbox 선택 후) | `연결됨: Gemplus USB Smart Card Reader 0 (ATR=3BDF95…0076)` |
+| `WARM_RESET` | `Warm Reset OK: ... (ATR=3BDF95…0076)` |
+| `TRANSMIT 00A4040000` | `<= 6112 (SW=6112)` |
+| `DISCONNECT` | `연결 끊김: Gemplus USB Smart Card Reader 0` |
+
+#### 4-C. Auto Get Response (체크박스 ON)
+입력: `00A4040000`
+```
+=> TRANSMIT 00A4040000
+<= 6112  (SW=6112)
+[auto] => TRANSMIT 00C0000012
+<= 6F108408A000000003000000A5049F6501FF9000  (SW=9000)
+```
+- 응답 분석: `6F10` (FCI Template) → `8408 A000000003000000` (AID=Visa) → `A504 9F6501FF` → SW `9000`
+- 자동 체인 1회, SW=9000으로 자연 종료
+
+#### 4-D. Origin 화이트리스트
+| 모드 | 시나리오 | 결과 |
+|---|---|---|
+| 평문 ws | Origin = `http://localhost:8080` | OPEN ✅ |
+| 평문 ws | Origin = `http://evil.example` | **HTTP 403** ✅ |
+| 평문 ws | Origin 없음 (Node 디폴트) | OPEN (개발 모드 허용) |
+| wss | Origin = `https://localhost:8443` | OPEN + READERS 푸시 수신 ✅ |
+| wss | Origin = `https://evil.example` | **HTTP 403** ✅ |
+| wss | Origin 없음 | **HTTP 403** (SECURE는 헤더 없는 연결도 거부) ✅ |
+| HTTPS | `GET /api/config` | `{"bridgeUrl":"wss://localhost:8444","secure":true,"version":"0.2.0"}` ✅ |
 
 ---
 
@@ -160,10 +203,23 @@ http://localhost:8080
 
 ### 5-4. 사용 흐름
 
-1. **`Card Reset`** 버튼 클릭 → 응답창에 `ATR: ...` 출력
-2. APDU 입력창에 헥사 문자열 입력 (기본값 `00A4040000`)
-3. **`Send APDU`** 버튼 클릭 → 응답창에 `<= 응답Hex (SW=상태워드)` 출력
-4. **`Clear`** 버튼으로 로그 초기화
+#### 권장 흐름 (Reader 명시적 관리)
+1. **0. Reader 선택** 카드의 리스트박스에서 리더기 선택
+   - `💳` 표시 = 카드 삽입됨, `∅` = 카드 없음, `✓연결됨` = 현재 세션
+2. **「연결」** 클릭 → 응답 로그에 `연결됨: <reader> (ATR=...)` 출력
+3. **2. APDU 전송** 입력창에 헥사 문자열 입력 (기본값 `00A4040000`)
+4. **「Send APDU」** 클릭 → `<= 응답Hex (SW=상태워드)` 출력
+5. **「Warm Reset」** — 세션을 유지한 채 카드만 다시 리셋 (새 ATR 확인)
+6. **「연결 끊기」** — 세션 종료
+7. **응답 로그 우상단 「Auto Get Response」** 체크 시 `61xx`/`6Cxx`에 대해 자동 후속 APDU 송신
+
+#### 단순 흐름 (Card Reset 단일 버튼)
+- **`Card Reset`** 클릭 — 선택된 리더기에 cold connect + ATR 확인 (`CONNECT` 와 동등 결과)
+- 이후 동일하게 APDU 전송 사용 가능
+
+#### 기타
+- **`Clear`** 버튼으로 로그 초기화
+- 리더기/카드 hot-plug는 자동 감지되어 listbox에 반영됨
 
 ---
 
@@ -194,9 +250,78 @@ docker compose down
 
 ---
 
-## 8. 다음 단계 후보
+## 8. SECURE 모드 (HTTPS + wss + Origin 화이트리스트)
 
-- **(b)** wss/HTTPS 운영 모드 + Origin 화이트리스트
+평문 모드(8080/8081) 외에 자체 서명 인증서 기반의 보안 모드를 지원합니다.
+
+### 8-1. 인증서 발급 (최초 1회)
+
+```powershell
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SClient
+npm install
+node gen-cert.js
+```
+
+→ `../certs/server.key`, `../certs/server.crt` 생성됨. `--force` 옵션으로 재발급 가능.
+
+### 8-2. SECURE 모드 실행
+
+**터미널 ① — 브리지(wss)**
+```powershell
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SClient
+$env:SECURE = '1'
+node bridge.js
+```
+
+기동 로그 예:
+```
+[Bridge] WSS listening on wss://localhost:8444
+[Bridge] allowed origins: https://localhost:8443
+```
+
+**터미널 ② — 서버(HTTPS)**
+```powershell
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SWebserver
+$env:SECURE = '1'
+node server.js
+```
+
+→ `https://localhost:8443` 으로 접속. 자체 서명 인증서이므로 브라우저에서 **「고급 → 안전하지 않음으로 이동」** 한 번만 수락하면 됩니다. 페이지의 `/api/config` 가 자동으로 `wss://localhost:8444` 를 가리키므로 추가 설정은 불필요합니다.
+
+### 8-3. 환경변수
+
+| 변수 | 기본값(평문) | 기본값(SECURE) | 설명 |
+|---|---|---|---|
+| `SECURE` | – | `1` | HTTPS/wss 모드 활성화 |
+| `SWEB_PORT` | `8080` | `8443` | 웹 서버 포트 |
+| `BRIDGE_PORT` | `8081` | `8444` | 브리지 포트 |
+| `BRIDGE_HOST` | `localhost` | `localhost` | 브리지 호스트(SWebserver가 알려주는 값) |
+| `ALLOWED_ORIGINS` | `http://localhost:8080` | `https://localhost:8443` | 콤마 구분 화이트리스트 |
+
+### 8-4. Origin 화이트리스트 검증 결과
+
+`smoke_origin.js` (평문 8081) / `smoke_wss.js` (wss 8444) 실측:
+
+| 시나리오 | 결과 |
+|---|---|
+| 평문 / Origin = `http://localhost:8080` | **OPEN** ✅ |
+| 평문 / Origin = `http://evil.example` | **HTTP 403** ✅ |
+| 평문 / Origin 없음 | OPEN(개발 모드) |
+| wss / Origin = `https://localhost:8443` | **OPEN** + READERS 푸시 수신 ✅ |
+| wss / Origin = `https://evil.example` | **HTTP 403** ✅ |
+| wss / Origin 없음 | **HTTP 403** (SECURE는 헤더 없는 연결도 거부) ✅ |
+
+### 8-5. 운영 환경 마이그레이션 시 체크리스트
+- 자체 서명 인증서를 정식 인증서(예: Let's Encrypt 또는 사내 CA 발급) 로 교체.
+- `ALLOWED_ORIGINS`를 실제 운영 호스트로 명시(콤마 구분).
+- Docker로 띄울 경우 `certs/`를 read-only 볼륨으로 마운트하고 `SECURE=1`, `SWEB_PORT=8443` 환경변수 전달.
+- 브라우저 mixed content 차단을 피하려면 페이지(HTTPS)와 브리지(wss)가 반드시 같은 보안 등급이어야 함.
+
+---
+
+## 9. 다음 단계 후보
+
 - **(c)** APDU 명령 프리셋 버튼 (SELECT MF, READ BINARY, GET DATA, …) UI 확장
 - **(e)** 명령/응답 히스토리 영구 저장(JSONL) 및 다운로드 기능
-- **(f)** Chained APDU(`61xx`, `6Cxx`) 자동 GET RESPONSE 처리
+- ~~**(f)** Chained APDU(`61xx`, `6Cxx`) 자동 GET RESPONSE 처리~~ ✅ 완료
+- ~~**(b)** wss/HTTPS 운영 모드 + Origin 화이트리스트~~ ✅ 완료

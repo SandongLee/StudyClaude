@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "ws": "^8.18.0",
-    "@pokusew/pcsclite": "^0.6.0"
+    "@pokusew/pcsclite": "^0.6.0",
+    "selfsigned": "^2.4.1"
   }
 }
