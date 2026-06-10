@@ -16,6 +16,26 @@ function verifyOrigin(origin) {
   return ALLOWED_ORIGINS.includes(origin);
 }
 
+function looksMojibake(s) {
+  if (typeof s !== 'string' || !s) return false;
+  if (s.includes('�')) return true;
+  const suspicious = s.match(/[^\x00-\x7F가-힣ㄱ-ㆎ　-〿＀-￯\s.,;:!?()'"\-]/g);
+  return !!(suspicious && suspicious.length >= 2);
+}
+
+function sanitizeErrorMessage(err) {
+  const raw = (err && err.message != null) ? String(err.message) : '';
+  if (!looksMojibake(raw)) return raw || 'Unknown error';
+  const code = err && (err.code || err.errno);
+  let codeStr = '';
+  if (code !== undefined && code !== null) {
+    codeStr = typeof code === 'number'
+      ? ` (code=0x${(code >>> 0).toString(16).toUpperCase().padStart(8, '0')})`
+      : ` (code=${code})`;
+  }
+  return `PC/SC 시스템 오류${codeStr}`;
+}
+
 function verifyClient(info, cb) {
   const origin = info.origin || info.req.headers.origin || '';
   if (verifyOrigin(origin)) return cb(true);
@@ -115,6 +135,7 @@ function connectReader(name, share = 'shared') {
   return new Promise((resolve, reject) => {
     const info = readers.get(name);
     if (!info) return reject(new Error(`리더기를 찾을 수 없습니다: ${name}`));
+    if (!info.hasCard) return reject(new Error(`카드가 리더기에 삽입되어 있지 않습니다: ${name}`));
     const reader = info.reader;
     const shareMode = share === 'exclusive'
       ? reader.SCARD_SHARE_EXCLUSIVE
@@ -136,6 +157,7 @@ function connectReader(name, share = 'shared') {
 async function coldResetReader(name) {
   const info = readers.get(name);
   if (!info) throw new Error(`리더기를 찾을 수 없습니다: ${name}`);
+  if (!info.hasCard) throw new Error(`카드가 리더기에 삽입되어 있지 않습니다: ${name}`);
   const reader = info.reader;
 
   if (session.name && session.name !== name) {
@@ -176,6 +198,7 @@ function warmResetReader() {
     if (!session.name) return reject(new Error('연결된 리더기가 없습니다. 먼저 연결하세요.'));
     const info = readers.get(session.name);
     if (!info) return reject(new Error('세션 리더가 더 이상 존재하지 않습니다.'));
+    if (!info.hasCard) return reject(new Error('카드가 리더기에서 제거되었습니다.'));
     const reader = info.reader;
     const name = session.name;
     const protos = reader.SCARD_PROTOCOL_T0 | reader.SCARD_PROTOCOL_T1;
@@ -225,6 +248,7 @@ function transmitApdu(hex) {
     if (!session.name) return reject(new Error('카드가 연결되어 있지 않습니다. 먼저 연결하세요.'));
     const info = readers.get(session.name);
     if (!info) return reject(new Error('세션 리더가 더 이상 존재하지 않습니다.'));
+    if (!info.hasCard) return reject(new Error('카드가 리더기에서 제거되었습니다.'));
     const cmd = Buffer.from(hex, 'hex');
     info.reader.transmit(cmd, 512, session.protocol, (err, data) => {
       if (err) return reject(err);
@@ -312,8 +336,10 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'ERROR', message: `unknown action: ${msg.action}` }));
       }
     } catch (err) {
-      console.error(`[Bridge] action error: ${err.message}`);
-      ws.send(JSON.stringify({ type: 'ERROR', message: err.message }));
+      const safe = sanitizeErrorMessage(err);
+      const rawDump = (err && err.message != null) ? String(err.message) : '';
+      console.error(`[Bridge] action error: ${safe}` + (safe !== rawDump ? ` | raw: ${JSON.stringify(rawDump).slice(0, 200)}` : ''));
+      ws.send(JSON.stringify({ type: 'ERROR', message: safe }));
     }
   });
 

@@ -45,6 +45,9 @@
    - `selfsigned` 기반 `gen-cert.js`로 self-signed 인증서 자동 발급
    - 브리지·서버 모두 `SECURE=1` 환경변수로 토글, `/api/config` 가 자동으로 `wss` URL 반환
    - `verifyClient`로 Origin 검증 — SECURE 모드에서는 Origin 헤더 없는 연결도 거부
+10. **한국어 Windows에서 PC/SC 에러 메시지 깨짐 수정** — §4-3 참조
+    - 카드 미삽입 케이스: `info.hasCard` 사전 검사로 우회 (네이티브 모듈 호출 자체를 회피)
+    - 그 외 시스템 에러: `sanitizeErrorMessage()`가 mojibake 감지 시 `PC/SC 시스템 오류 (code=0x…)` 형태로 대체
 
 ---
 
@@ -95,6 +98,14 @@ SWT/
 - **증상**: 첫 RESET 직후 `transmit()` 호출이 "Third argument must be an integer"로 거부
 - **원인**: `reader.connect` 콜백의 `protocol` 인자가 간헐적으로 정수 외 타입으로 들어오는 케이스
 - **수정**: `typeof protocol === 'number'` 검증 + 실패 시 `SCARD_PROTOCOL_T0` fallback
+
+### 4-3. 한국어 Windows에서 PC/SC 에러 메시지 깨짐
+- **증상**: 카드 미삽입 상태에서 「연결」을 누르면 응답창의 한글이 mojibake로 출력 (`ERROR: ▒▒▒▒…`)
+- **원인**: `@pokusew/pcsclite`가 받는 Windows PC/SC 시스템 에러 메시지가 **CP949(ANSI)** 인데, Node.js가 UTF-8로 해석하면서 깨짐
+- **수정**
+  - `connectReader` / `coldResetReader` / `warmResetReader` / `transmitApdu`에 `info.hasCard` 사전 검사 추가 — 카드 미삽입 시 우리가 직접 작성한 한국어 메시지로 reject (네이티브 호출 회피)
+  - `sanitizeErrorMessage(err)` 함수가 mojibake(`�` 또는 비-ASCII/비-한글 시퀀스) 감지 시 `PC/SC 시스템 오류 (code=0x…)` 형태로 대체하고, 원본 raw 메시지는 stderr 로그에만 기록 (진단용)
+- **실측**: 카드 미삽입 + `Gemalto Prox-DU Contact_13801025 0` 선택 → 「연결」 클릭 → `ERROR: 카드가 리더기에 삽입되어 있지 않습니다: Gemalto Prox-DU Contact_13801025 0` (Cold Reset도 동일)
 
 ### 검증 결과 (실측)
 
@@ -263,6 +274,7 @@ docker compose down
 | RESET 응답 `atr: null` | 카드 미삽입. 카드 삽입 후 다시 RESET. |
 | TRANSMIT `ERROR: ...` | 카드가 분리됐거나 RESET 누락. RESET을 먼저 실행. |
 | Docker 8080 충돌 | 다른 컨테이너가 8080 사용 중. `docker ps`로 확인 후 정리. |
+| `ERROR: ▒▒▒▒…` (한글 깨짐) | 한국어 Windows에서 PC/SC 시스템 메시지가 CP949로 들어오며 발생. §4-3 sanitize로 정상화됨 — 그래도 보이면 브리지 stderr의 `raw:` 로그로 진단. |
 
 ---
 
