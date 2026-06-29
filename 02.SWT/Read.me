@@ -1,0 +1,14 @@
+1.브릿지
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SClient
+$env:SECURE='1'
+node bridge.js
+
+2.서버
+# 옵션 A: Docker (명세서 기본)
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SWebserver
+docker compose up --build -d
+
+# 옵션 B: Node 직접 실행
+cd C:\Users\netbomb\Desktop\SKTL\OneDrive\일\70.Claude\02.SWT\SWebserver
+$env:SECURE='1'
+node server.js

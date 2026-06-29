@@ -236,7 +236,7 @@
           } else if (msg.type === 'RESET_OK') {
             log(`ATR: ${msg.atr}`);
           } else if (msg.type === 'TRANSMIT_OK') {
-            log(`<= ${msg.response}  (SW=${msg.sw})`);
+            log(`[R]<= ${msg.response}  (SW=${msg.sw})`);
             maybeAutoGetResponse(msg);
           } else if (msg.type === 'ERROR') {
             log(`ERROR: ${msg.message}`);
@@ -290,7 +290,7 @@
 
     function sendApdu(hex, auto) {
       lastApdu = hex.toUpperCase();
-      log(`${auto ? '[auto] ' : ''}=> TRANSMIT ${lastApdu}`);
+      log(`${auto ? '[auto] ' : ''}[T]=> ${lastApdu}`);
       send({ action: 'TRANSMIT', apdu: lastApdu });
     }
 
